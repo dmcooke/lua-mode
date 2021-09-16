@@ -1956,19 +1956,13 @@ This function just searches for a `end' at the beginning of a line."
 
 (defun lua-make-lua-string (str)
   "Convert string to Lua literal."
-  (save-match-data
-    (with-temp-buffer
-      (insert str)
-      (goto-char (point-min))
-      (while (re-search-forward "[\"'\\\t\\\n]" nil t)
-        (cond
-         ((string= (match-string 0) "\n")
-          (replace-match "\\\\n"))
-         ((string= (match-string 0) "\t")
-          (replace-match "\\\\t"))
-         (t
-          (replace-match "\\\\\\&" t))))
-      (concat "'" (buffer-string) "'"))))
+  ;; Use long strings to preserve newlines: lua repl has 512-byte
+  ;; limit for length of input lines.
+  ;; == is likely to show up in code, so we'll start with ===
+  (let ((quote-str "==="))
+    (while (string-match-p quote-str str)
+      (setq quote-str (concat quote-str "=")))
+    (concat "[" quote-str "[" str "]" quote-str "]")))
 
 ;;;###autoload
 (defalias 'run-lua #'lua-start-process)
