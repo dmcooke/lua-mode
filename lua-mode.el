@@ -310,9 +310,6 @@ Should be a list of strings."
   :group 'lua)
 
 
-(defvar lua-process nil
-  "The active Lua process")
-
 (defvar lua-process-buffer nil
   "Buffer used for communication with the Lua process.")
 
@@ -1939,13 +1936,15 @@ This function just searches for a `end' at the beginning of a line."
 
 (defvar lua-process-init-code
   (mapconcat
-   'identity
+   #'identity
    '("local loadstring = loadstring or load"
      "function luamode_loadstring(str, displayname, lineoffset)"
+     "  if _DEBUG_LUAMODE then"
+     "    print(string.format('%q', str), displayname, lineoffset)"
+     "  end"
      "  if lineoffset > 1 then"
      "    str = string.rep('\\n', lineoffset - 1) .. str"
      "  end"
-     ""
      "  local x, e = loadstring(str, '@'..displayname)"
      "  if e then"
      "    error(e)"
@@ -1959,13 +1958,79 @@ This function just searches for a `end' at the beginning of a line."
   ;; Use long strings to preserve newlines: lua repl has 512-byte
   ;; limit for length of input lines.
   ;; == is likely to show up in code, so we'll start with ===
-  (let ((quote-str "==="))
-    (while (string-match-p quote-str str)
-      (setq quote-str (concat quote-str "=")))
-    (concat "[" quote-str "[" str "]" quote-str "]")))
+  (let ((lengths nil) (start 0))
+    (save-match-data
+      (while (string-match "===+" str start)
+        (setq start (match-end 0))
+        (push (- start (match-beginning 0)) lengths)))
+    (setq lengths (sort lengths #'<))
+    ;; Search for a value >= 3 that's not in lengths
+    (let ((n 3))
+      (while (and lengths (<= (car lengths) n))
+        (setq n (1+ (car lengths))
+              lengths (cdr lengths)))
+      (let ((quote-str (make-string n ?=)))
+        (concat "[" quote-str "[\n" str "]" quote-str "]")))))
 
 ;;;###autoload
 (defalias 'run-lua #'lua-start-process)
+
+(defvar-local lua-process-command nil
+  "Command to run a Lua interpreter.
+
+This may be a string, in which case it's taken as the name of the
+program to run. The Lua process buffer will be named with this
+name surrounded by *s (e.g., '*lua*').
+
+Otherwise (if not nil), this should be a list of at least 2 elements,
+of the form (NAME PROGRAM) or (NAME PROGRAM STARTFILE . SWITCHES),
+which should be valid as the arguments to `make-comint'.")
+
+(defun lua--start-process (name program &optional startfile &rest switches)
+  (unless name
+    (setq name (or (car-safe lua-default-application)
+                   lua-default-application)))
+  (unless program
+    (setq program name))
+  (unless switches
+    (setq switches lua-default-command-switches))
+  (setq lua-process-buffer (get-buffer (format "*%s*" name)))
+  (unless (comint-check-proc lua-process-buffer)
+    (let ((comint-args `(,name ,program ,startfile ,@switches)))
+      (setq lua-process-buffer (apply #'make-comint comint-args))
+      (let ((proc (get-buffer-process lua-process-buffer)))
+        (set-process-query-on-exit-flag proc nil)
+        (with-current-buffer lua-process-buffer
+          ;; Allow re-running this command in this buffer if the
+          ;; process is killed
+          (setq-local lua-process-command comint-args)
+          ;; enable error highlighting in stack traces
+          (require 'compile)
+          (setq lua--repl-buffer-p t)
+          (make-local-variable 'compilation-error-regexp-alist)
+          (setq compilation-error-regexp-alist
+                (cons (list lua-traceback-line-re 1 2)
+                      compilation-error-regexp-alist))
+          (compilation-shell-minor-mode 1)
+          (setq-local comint-prompt-regexp lua-prompt-regexp)
+          ;; Don't send initialization code until seeing the prompt to
+          ;; ensure that the interpreter is ready.
+          (while (not (lua-prompt-line))
+            (accept-process-output proc)
+            (goto-char (point-max)))
+          (lua--send-string proc lua-process-init-code)))))
+  lua-process-buffer)
+
+(defun lua--default-start-process ()
+  (cond ((stringp lua-process-command)
+         (lua--start-process lua-process-command nil))
+        ((consp lua-process-command)
+         (apply #'lua--start-process lua-process-command))
+        (lua-process-command
+         (error "invalid value for `lua-process-command'"))
+        (t
+         (lua--start-process nil nil))))
+
 
 ;;;###autoload
 (defun lua-start-process (&optional name program startfile &rest switches)
@@ -1973,49 +2038,25 @@ This function just searches for a `end' at the beginning of a line."
 PROGRAM defaults to NAME, which defaults to `lua-default-application'.
 When called interactively, switch to the process buffer."
   (interactive)
-  (setq name (or name (if (consp lua-default-application)
-                          (car lua-default-application)
-                        lua-default-application)))
-  (setq program (or program lua-default-application))
-  ;; don't re-initialize if there already is a lua process
-  (unless (comint-check-proc (format "*%s*" name))
-    (setq lua-process-buffer (apply #'make-comint name program startfile
-                                    (or switches lua-default-command-switches)))
-    (setq lua-process (get-buffer-process lua-process-buffer))
-    (set-process-query-on-exit-flag lua-process nil)
-    (with-current-buffer lua-process-buffer
-      ;; enable error highlighting in stack traces
-      (require 'compile)
-      (setq lua--repl-buffer-p t)
-      (make-local-variable 'compilation-error-regexp-alist)
-      (setq compilation-error-regexp-alist
-            (cons (list lua-traceback-line-re 1 2)
-                  compilation-error-regexp-alist))
-      (compilation-shell-minor-mode 1)
-      (setq-local comint-prompt-regexp lua-prompt-regexp)
-
-      ;; Don't send initialization code until seeing the prompt to ensure that
-      ;; the interpreter is ready.
-      (while (not (lua-prompt-line))
-        (accept-process-output (get-buffer-process (current-buffer)))
-        (goto-char (point-max)))
-      (lua-send-string lua-process-init-code)))
-
+  (if (not (or name program startfile switches))
+      (lua--default-start-process)
+    (apply #'lua--start-process name program startfile switches))
   ;; when called interactively, switch to process buffer
   (if (called-interactively-p 'any)
       (switch-to-buffer lua-process-buffer)))
 
 (defun lua-get-create-process ()
   "Return active Lua process creating one if necessary."
-  (lua-start-process)
-  lua-process)
+  (unless (comint-check-proc lua-process-buffer)
+    (lua--default-start-process))
+  (get-buffer-process lua-process-buffer))
 
 (defun lua-kill-process ()
   "Kill Lua process and its buffer."
   (interactive)
   (when (buffer-live-p lua-process-buffer)
-    (kill-buffer lua-process-buffer)
-    (setq lua-process-buffer nil)))
+    (kill-buffer lua-process-buffer))
+  (setq lua-process-buffer nil))
 
 (defun lua-set-lua-region-start (&optional arg)
   "Set start of region for use with `lua-send-lua-region'."
@@ -2027,17 +2068,22 @@ When called interactively, switch to the process buffer."
   (interactive)
   (set-marker lua-region-end (or arg (point))))
 
+(defun lua--send-string (proc str)
+  (unless (string-equal (substring str -1) "\n")
+    (setq str (concat str "\n")))
+  (comint-send-string proc str))
+;;  (process-send-string proc str))
+
 (defun lua-send-string (str)
   "Send STR plus a newline to the Lua process.
 
-If `lua-process' is nil or dead, start a new process first."
-  (unless (string-equal (substring str -1) "\n")
-    (setq str (concat str "\n")))
-  (process-send-string (lua-get-create-process) str))
+If `lua-process-buffer' is nil or dead, start a new process first."
+  (lua--send-string (lua-get-create-process) str))
 
 (defun lua-send-current-line ()
-  "Send current line to the Lua process, found in `lua-process'.
-If `lua-process' is nil or dead, start a new process first."
+  "Send current line to the Lua process buffer.
+
+If `lua-process-buffer' is nil or dead, start a new process first."
   (interactive)
   (lua-send-region (line-beginning-position) (line-end-position)))
 
