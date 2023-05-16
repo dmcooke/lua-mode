@@ -947,15 +947,18 @@ Return the amount the indentation changed by."
     ;; At this point, we know that we're inside comment, so make sure
     ;; close-bracket is unindented like a block that starts after
     ;; left-shifter.
-    (let ((left-shifter-p (looking-at "\\s *\\(?:--\\)?\\]\\(?1:=*\\)\\]")))
+    (let ((left-shifter-p (looking-at "\\s *\\(?:--\\)?\\]\\(?1:=*\\)\\]"))
+          (cur-indent (current-indentation)))
       (save-excursion
         (goto-char (lua-comment-or-string-start-pos))
-        (+ (current-indentation)
-           (if (and left-shifter-p
-                    (looking-at (format "--\\[%s\\["
-                                        (match-string-no-properties 1))))
-               0
-             lua-indent-level))))))
+        (if (and left-shifter-p
+                 (looking-at (format "--\\[%s\\["
+                                     (match-string-no-properties 1))))
+            (current-indentation)
+          ;; TODO: indentation in a long comment should be customizable
+          ;; (0 is reasonable)
+          (max (+ (current-indentation) lua-indent-level)
+               cur-indent))))))
 
 
 (defun lua--signum (x)
